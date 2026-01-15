@@ -558,7 +558,7 @@ courseid = input('请输入courseid:')
 
 
 finish,total,chapterids = find_chapterid(courseid, clazzid,personid)
-
+finish = int(finish)
 
 print(f'已完成任务点数:{finish},总任务点数:{total}')
 # print(chapterids)
@@ -567,6 +567,7 @@ interval = 30    #视频提交间隔（建议30到60）
 
 for chapterid in chapterids:
     main(clazzid, courseid, chapterid, personid, cookies,interval)
+
 
 
 
