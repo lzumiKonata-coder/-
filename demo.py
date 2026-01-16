@@ -4,34 +4,74 @@ import execjs
 import time
 import json
 from config import *
+import logging
 from bs4 import BeautifulSoup
 from hashlib import md5
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-def get_enc(clazzid,userid,jobid,objectid,playingtime,duration,clipTime):
-    # 定义模板字符串
+# ====================== 全局配置 ======================
+# 初始化Session，自动管理Cookie，添加重试/超时配置
+session = requests.Session()
+# 配置重试策略
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=0.5,
+    status_forcelist=[429, 500, 502, 503, 504],
+)
+adapter = HTTPAdapter(max_retries=retry_strategy)
+session.mount('https://', adapter)
+session.mount('http://', adapter)
+# 全局请求头
+session.headers.update({
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
+    'Accept-Language': 'zh-CN,zh;q=0.9',
+    'sec-ch-ua': '"Google Chrome";v="137", "Chromium";v="137", "Not/A)Brand";v="24"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+})
+
+# 预编译正则（减少重复编译开销）
+RE_JSESSIONID = re.compile(r'JSESSIONID=(.*?);')
+RE_ROUTE = re.compile(r'route=(.*?);')
+RE_S = re.compile(r'\?s=(.*?)\'')
+RE_K8S = re.compile(r'k8s=(.*?);')
+RE_JROSE = re.compile(r'jrose=(.*?);')
+RE_ENC = re.compile(r'<input type="hidden" id="enc" name="enc" value="(.*?)"/>')
+RE_FINISH = re.compile(r'已完成任务点: <span style="color:#00B368">(.*?)<')
+RE_TOTAL = re.compile(r'</span>/(\d+)')
+RE_V1 = re.compile(r'v=(.*?)&')
+RE_V2 = re.compile(r'modules/video/index-review.html\?v=(.*?)"')
+RE_USERID = re.compile(r'"userid":"(.*?)",')
+RE_MARG = re.compile(r'mArg = (.*?);')
+RE_OTHERINFO = re.compile(r'(.*?)&')
+RE_NUMBER = re.compile(r'(\d+)')
+
+# 配置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# ====================== 核心函数 ======================
+def get_enc(clazzid, userid, jobid, objectid, playingtime, duration, clipTime):
+    """生成加密串"""
     template = '[{0}][{1}][{2}][{3}][{4}][{5}][{6}][{7}]'
-
-    # 按占位符顺序传入参数
     result = template.format(
-        clazzid,          # {0}
-        userid,                 # {1}
-        jobid or '',            # {2}
-        objectid,               # {3}
-        playingtime*1000,       # {4}
-        'd_yHJ!$pdA~5',         # {5}
-        duration * 1000,        # {6}  duration*1000
-        clipTime                # {7}
+        clazzid, userid, jobid or '', objectid,
+        playingtime*1000, 'd_yHJ!$pdA~5', duration * 1000, clipTime
     )
+    return md5(result.encode('utf-8')).hexdigest()
 
-    enc = md5(result.encode('utf-8')).hexdigest()
-    return enc
-
-def get_cookies(uname,pwd):
+def get_cookies(uname, pwd):
+    """登录并获取Cookie（Session自动维护，无需返回cookies字典）"""
+    # 第一步：获取初始Cookie
+    params = {
+        'fid': '',
+        'newversion': 'true',
+        'refer': 'https://i.chaoxing.com',
+    }
     headers = {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-        'Accept-Language': 'zh-CN,zh;q=0.9',
         'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
         'Pragma': 'no-cache',
         'Referer': 'https://i.chaoxing.com/',
         'Sec-Fetch-Dest': 'document',
@@ -39,37 +79,19 @@ def get_cookies(uname,pwd):
         'Sec-Fetch-Site': 'same-site',
         'Sec-Fetch-User': '?1',
         'Upgrade-Insecure-Requests': '1',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
-        'sec-ch-ua': '"Google Chrome";v="137", "Chromium";v="137", "Not/A)Brand";v="24"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
     }
-    params = {
-        'fid': '',
-        'newversion': 'true',
-        'refer': 'https://i.chaoxing.com',
-    }
+    # 使用session发起请求，自动保存Cookie
+    session.get('https://passport2.chaoxing.com/login', params=params, headers=headers, timeout=10)
 
-    response = requests.get('https://passport2.chaoxing.com/login', params=params, headers=headers)
-    all_headers = response.headers
-    cookies = all_headers.get('Set-Cookie')
-    JSESSIONID = re.search(r'JSESSIONID=(.*?);', cookies).group(1)
-    route = re.search(r'route=(.*?);', cookies).group(1)
-    cookies = {}
-    cookies['JSESSIONID'] = JSESSIONID
-    cookies['route'] = route
-
-
-    with open('encrypt.js', 'r') as f:
+    # 第二步：加载加密JS并获取加密后的账号密码
+    with open('encrypt.js', 'r', encoding='utf-8') as f:
         ctx = execjs.compile(f.read())
-
     data = ctx.call('get_uname_password', uname, pwd)
 
+    # 第三步：提交登录
     headers = {
         'Accept': 'application/json, text/javascript, */*; q=0.01',
-        'Accept-Language': 'zh-CN,zh;q=0.9',
         'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
         'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
         'Origin': 'https://passport2.chaoxing.com',
         'Pragma': 'no-cache',
@@ -77,18 +99,13 @@ def get_cookies(uname,pwd):
         'Sec-Fetch-Dest': 'empty',
         'Sec-Fetch-Mode': 'cors',
         'Sec-Fetch-Site': 'same-origin',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
         'X-Requested-With': 'XMLHttpRequest',
-        'sec-ch-ua': '"Google Chrome";v="137", "Chromium";v="137", "Not/A)Brand";v="24"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
     }
-
-    data = {
+    post_data = {
         'fid': '-1',
-        'uname': '{}'.format(data['uname']),
-        'password': '{}'.format(data['password']),
-        'refer': 'http%3A%2F%2Fi.chaoxing.com%2Fbase%3Ft%3D'+str(int(1000*time.time())),
+        'uname': data['uname'],
+        'password': data['password'],
+        'refer': 'http%3A%2F%2Fi.chaoxing.com%2Fbase%3Ft%3D' + str(int(1000 * time.time())),
         't': 'true',
         'forbidotherlogin': '0',
         'validate': '',
@@ -96,39 +113,24 @@ def get_cookies(uname,pwd):
         'independentId': '0',
         'independentNameId': '0',
     }
+    # Session自动携带Cookie，无需手动传cookies参数
+    response = session.post(
+        'https://passport2.chaoxing.com/fanyalogin',
+        headers=headers,
+        data=post_data,
+        timeout=10
+    )
+    if response.status_code != 200:
+        raise Exception(f'登录失败，状态码：{response.status_code}')
+    # 登录成功后，Session已自动保存所有Cookie，无需手动解析
+    logger.info('登录成功，Session已维护Cookie')
+    return True  # 只需返回登录成功标识
 
-    response = requests.post('https://passport2.chaoxing.com/fanyalogin', cookies=cookies, headers=headers, data=data)
-    all_headers = response.headers
-    set_cookies = all_headers.get('Set-Cookie')
-    fid = re.search(r'fid=(.*?);', set_cookies).group(1)
-    _uid = re.search(r'_uid=(.*?);', set_cookies).group(1)
-    _d = re.search(r'_d=(.*?);', set_cookies).group(1)
-    UID = re.search(r'UID=(.*?);', set_cookies).group(1)
-    vc3 = re.search(r'vc3=(.*?);', set_cookies).group(1)
-    uf = re.search(r'uf=(.*?);', set_cookies).group(1)
-    cx_p_token = re.search(r'cx_p_token=(.*?);', set_cookies).group(1)
-    p_auth_token = re.search(r'p_auth_token=(.*?);', set_cookies).group(1)
-    xxtenc = re.search(r'xxtenc=(.*?);', set_cookies).group(1)
-    DSSTASH_LOG = re.search(r'DSSTASH_LOG=(.*?);', set_cookies).group(1)
-    cookies = {}
-    cookies['fid'] = fid
-    cookies['_uid'] = _uid
-    cookies['_d'] = _d
-    cookies['UID'] = UID
-    cookies['vc3'] = vc3
-    cookies['uf'] = uf
-    cookies['cx_p_token'] = cx_p_token
-    cookies['p_auth_token'] = p_auth_token
-    cookies['xxtenc'] = xxtenc
-    cookies['DSSTASH_LOG'] = DSSTASH_LOG
-    return cookies
-
-def get_course_list(cookies):
+def get_course_list():
+    """获取课程列表（Session自动带Cookie）"""
     headers = {
         'Accept': 'text/html, */*; q=0.01',
-        'Accept-Language': 'zh-CN,zh;q=0.9',
         'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
         'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
         'Origin': 'https://mooc1-1.chaoxing.com',
         'Pragma': 'no-cache',
@@ -136,13 +138,8 @@ def get_course_list(cookies):
         'Sec-Fetch-Dest': 'empty',
         'Sec-Fetch-Mode': 'cors',
         'Sec-Fetch-Site': 'same-origin',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
         'X-Requested-With': 'XMLHttpRequest',
-        'sec-ch-ua': '"Google Chrome";v="137", "Chromium";v="137", "Not/A)Brand";v="24"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
     }
-
     data = {
         'courseType': '1',
         'courseFolderId': '0',
@@ -150,433 +147,341 @@ def get_course_list(cookies):
         'superstarClass': '',
         'courseFolderSize': '0',
     }
-
-    response = requests.post('https://mooc1-1.chaoxing.com/mooc-ans/visit/courselistdata', cookies=cookies, headers=headers, data=data)
+    response = session.post(
+        'https://mooc1-1.chaoxing.com/mooc-ans/visit/courselistdata',
+        headers=headers,
+        data=data,
+        timeout=10
+    )
     html_content = response.text
-
-    # 1. 解析HTML
     soup = BeautifulSoup(html_content, 'lxml')
-
-    # 2. 提取所有课程li标签（class为"course clearfix"）
     course_items = soup.find_all('li', class_='course clearfix')
-
-    # 3. 遍历每个课程，提取目标信息
     course_data = []
     for item in course_items:
         try:
-            # 提取li标签上的自定义属性：courseId、clazzId、personId
-            course_id = item.attrs.get('courseid', '')  # 若属性不存在，返回空字符串
-            clazz_id = item.attrs.get('clazzid', '')
-            person_id = item.attrs.get('personid', '')
-            id = item.attrs.get('id', '')
-
-            # 提取课程标题（span标签的title属性，class为"course-name overHidden2"）
-            title_span = item.find('span', class_='course-name overHidden2')
-            course_title = title_span.attrs.get('title', '') if title_span else ''
-
-            # 整理成字典，方便后续使用
             course_info = {
-                'clazzid': clazz_id,
-                'courseid': course_id,
-                'id': id,
-                'personid': person_id,
-                'title': course_title,
+                'clazzid': item.attrs.get('clazzid', ''),
+                'courseid': item.attrs.get('courseid', ''),
+                'id': item.attrs.get('id', ''),
+                'personid': item.attrs.get('personid', ''),
+                'title': item.find('span', class_='course-name overHidden2').attrs.get('title', '') if item.find('span', class_='course-name overHidden2') else '',
             }
             course_data.append(course_info)
-
         except Exception as e:
-            # 防止单个课程解析失败导致整体中断
-            print(f"解析某门课程时出错：{e}")
+            logger.error(f'解析课程失败：{e}')
             continue
     return course_data
 
-#knowledgeid ,cookies
-def find_chapterid(courseid,clazzid,personid):
-
+def find_chapterid(courseid, clazzid, personid):
+    """查找未完成的章节ID"""
+    # 第一步：获取s参数
+    params = {'t': f'{int(time.time() * 1000)}'}
     headers = {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-        'Accept-Language': 'zh-CN,zh;q=0.9',
         'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
         'Pragma': 'no-cache',
         'Sec-Fetch-Dest': 'document',
         'Sec-Fetch-Mode': 'navigate',
         'Sec-Fetch-Site': 'cross-site',
         'Upgrade-Insecure-Requests': '1',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
-        'sec-ch-ua': '"Google Chrome";v="137", "Chromium";v="137", "Not/A)Brand";v="24"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-        # 'Cookie': 'fid=604; _uid=340877631; _d=1768050124375; UID=340877631; vc3=dmXBEuXhoKNrcul%2FjHK440b61oTfE2Ph4DCmg3%2BAxPmj0SokV90%2BCGTg5P1QPCoE7sCbho12Wft1jAapUUI5A2hnzbAcbHgFRI9Lf1SYMFO8v5aVdvy%2F7zxI%2BE6EuSynb27kgQdfSrTa7mLeS268vk1aUYAQdLNvOBAMeCElf6o%3D02ada3b7517d3850d0b3b30521a8d74d; uf=fbe48ba271b0dbbda0f23d4d7560668d20c0c7f6174700c7924fba3709ea73d0599df2b2b27c1159c854e77cd3b513525d984d23a7662dfb9b0594e13f4b452fa995cca83579031aa94b593de5d847e4d649b59fbc966abce5851b744f8aa02c9fb3947ed09a594c2acbfa05dc5aa122da2c896ba76a37dca9f93ef6dfabec8dcdf9752c7b23a3419f747da084bc699570b5a05e402d2a6370184964ffe8c27c5732f38550869b59d62f3251e9fde267b1f899d50c1c3fa3aa2ebad65cd196bb; cx_p_token=f08c3e03d567b2cb11535c9998c98b30; p_auth_token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiIzNDA4Nzc2MzEiLCJsb2dpblRpbWUiOjE3NjgwNTAxMjQzNzcsImV4cCI6MTc2ODY1NDkyNH0.cAa4fg62lIF_KyxhJK1AdPmzN_-zv9VwtusuTtkLIs4; xxtenc=ae21f750236073e55c3ad2ed66e1b299; DSSTASH_LOG=C_38-UN_2388-US_340877631-T_1768050124377',
     }
-
-    params = {
-        't': f'{int(time.time() * 1000)}',
-    }
-
-    response = requests.get('http://i.chaoxing.com/base', params=params, cookies=cookies, headers=headers)
+    response = session.get('http://i.chaoxing.com/base', params=params, headers=headers, timeout=10)
     content = response.text
-    s = re.search(r'\?s=(.*?)\'', content).group(1)
-    # print(content)
-    # print(s)
+    s_match = RE_S.search(content)
+    if not s_match:
+        raise Exception('未提取到s参数')
+    s = s_match.group(1)
 
+    # 第二步：访问interaction页面（Session自动处理Cookie）
     headers = {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-        'Accept-Language': 'zh-CN,zh;q=0.9',
         'Cache-Control': 'no-cache',
-        'Connection': 'keep-alive',
         'Pragma': 'no-cache',
         'Referer': 'https://i.chaoxing.com/',
         'Sec-Fetch-Dest': 'iframe',
         'Sec-Fetch-Mode': 'navigate',
         'Sec-Fetch-Site': 'same-site',
         'Upgrade-Insecure-Requests': '1',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
-        'sec-ch-ua': '"Google Chrome";v="137", "Chromium";v="137", "Not/A)Brand";v="24"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
-        # 'Cookie': 'fid=604; _uid=340877631; _d=1768050124375; UID=340877631; vc3=dmXBEuXhoKNrcul%2FjHK440b61oTfE2Ph4DCmg3%2BAxPmj0SokV90%2BCGTg5P1QPCoE7sCbho12Wft1jAapUUI5A2hnzbAcbHgFRI9Lf1SYMFO8v5aVdvy%2F7zxI%2BE6EuSynb27kgQdfSrTa7mLeS268vk1aUYAQdLNvOBAMeCElf6o%3D02ada3b7517d3850d0b3b30521a8d74d; uf=fbe48ba271b0dbbda0f23d4d7560668d20c0c7f6174700c7924fba3709ea73d0599df2b2b27c1159c854e77cd3b513525d984d23a7662dfb9b0594e13f4b452fa995cca83579031aa94b593de5d847e4d649b59fbc966abce5851b744f8aa02c9fb3947ed09a594c2acbfa05dc5aa122da2c896ba76a37dca9f93ef6dfabec8dcdf9752c7b23a3419f747da084bc699570b5a05e402d2a6370184964ffe8c27c5732f38550869b59d62f3251e9fde267b1f899d50c1c3fa3aa2ebad65cd196bb; cx_p_token=f08c3e03d567b2cb11535c9998c98b30; p_auth_token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiIzNDA4Nzc2MzEiLCJsb2dpblRpbWUiOjE3NjgwNTAxMjQzNzcsImV4cCI6MTc2ODY1NDkyNH0.cAa4fg62lIF_KyxhJK1AdPmzN_-zv9VwtusuTtkLIs4; xxtenc=ae21f750236073e55c3ad2ed66e1b299; DSSTASH_LOG=C_38-UN_2388-US_340877631-T_1768050124377; spaceFid=604; spaceRoleId=""',
     }
+    session.get('https://mooc1-1.chaoxing.com/visit/interaction', params={'s': s}, headers=headers, timeout=10)
 
+    # 第三步：获取enc参数
     params = {
-        's': f'{s}',
-    }
-
-    response = requests.get('https://mooc1-1.chaoxing.com/visit/interaction', params=params, cookies=cookies,
-                            headers=headers)
-    all_headers = response.headers
-    set_cookies = all_headers['Set-Cookie']
-    k8s = re.search(r'k8s=(.*?);', set_cookies).group(1)
-    jrose = re.search(r'jrose=(.*?);', set_cookies).group(1)
-    route = re.search(r'route=(.*?);', set_cookies).group(1)
-    cookies['k8s'] = k8s
-    cookies['jrose'] = jrose
-    cookies['route'] = route
-    # print(cookies)
-
-    headers = {
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
-        # 'referer': 'https://mooc1-1.chaoxing.com/visit/interaction?s=1a02f4c43f48fb2856b975e81df0c67a',
-    }
-
-    params = {
-        'courseid': f'{courseid}',
-        'clazzid': f'{clazzid}',
+        'courseid': courseid,
+        'clazzid': clazzid,
         'vc': '1',
-        'cpi': f'{personid}',
+        'cpi': personid,
         'ismooc2': '1',
         'v': '2',
     }
-    response = requests.get(
+    headers = {'referer': 'https://mooc1-1.chaoxing.com/visit/interaction?s=1a02f4c43f48fb2856b975e81df0c67a'}
+    response = session.get(
         'https://mooc1-1.chaoxing.com/mooc-ans/visit/stucoursemiddle',
         params=params,
-        cookies=cookies,
         headers=headers,
+        timeout=10
     )
+    enc_match = RE_ENC.search(response.text)
+    if not enc_match:
+        raise Exception('未提取到enc参数')
+    enc = enc_match.group(1)
 
-    content = response.text
-    # print(content)
-    enc = re.search(r'<input type="hidden" id="enc" name="enc" value="(.*?)"/>', content).group(1)
-    # print(enc)
-    all_headers = response.headers
-    set_cookies = all_headers['Set-Cookie']
-    jrose = re.search(r'jrose=(.*?);', set_cookies).group(1)
-    # route = re.search(r'route=(.*?);', set_cookies).group(1)
-    cookies['jrose'] = jrose
-    # cookies['route'] = route
-    # print(all_headers)
-
+    # 第四步：获取章节进度
+    params = {
+        'courseid': courseid,
+        'clazzid': clazzid,
+        'cpi': personid,
+        'ut': 's',
+        't': f'{int(time.time() * 1000)}',
+        'stuenc': enc,
+    }
     headers = {
         'host': 'mooc2-ans.chaoxing.com',
-        'sec-ch-ua': '"Google Chrome";v="137", "Chromium";v="137", "Not/A)Brand";v="24"',
-        'sec-ch-ua-mobile': '?0',
-        'sec-ch-ua-platform': '"Windows"',
         'upgrade-insecure-requests': '1',
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
-        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
         'sec-fetch-site': 'same-origin',
         'sec-fetch-mode': 'navigate',
         'sec-fetch-user': '?1',
         'sec-fetch-dest': 'iframe',
-
-        # 'accept-encoding': 'gzip, deflate, br, zstd',
-        'accept-language': 'zh-CN,zh;q=0.9',
         'priority': 'u=0, i',
-        # 'cookie': 'k8s=1768048371.498.5102.324410; route=bca6486eee9aca907e6257b7921729c3; fid=604; source=""; _uid=340877631; _d=1768102825152; UID=340877631; vc3=QCerNmM7VYPQFnLMJE1ykzLKibbQKv3ofX%2B9Bbn%2BAwXxXVx%2FMojtFql7BCgWDNplFyUMgDdphTQZuadz3lPTt9LX3hlE5ouCf3pJmRRE8ADvCJCnjCrm6J5ybj9O1A8MyBZE2Tp7WSlHACtXhv5LvPduOh5r9a6%2BMDkidk15b3A%3D503c7460e7813c24336144d9a7b86db0; uf=fbe48ba271b0dbbda0f23d4d7560668d20c0c7f6174700c7924fba3709ea73d09f424c3caac2622f78abafae41430b335d984d23a7662dfb9b0594e13f4b452fa995cca83579031aa94b593de5d847e4d649b59fbc966abce5851b744f8aa02c9fb3947ed09a594cb656531ee955ab093783faf299eb07b207aa1c10b563632f4dfd8fe371d6b8268e0cb4577cddd1f270b5a05e402d2a6370184964ffe8c27cf42ab3d23ff0667eae07e83b67ff7d52b1f899d50c1c3fa3aa2ebad65cd196bb; cx_p_token=15a111fe7605580357259da7cbe29d31; p_auth_token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiIzNDA4Nzc2MzEiLCJsb2dpblRpbWUiOjE3NjgxMDI4MjUxNTQsImV4cCI6MTc2ODcwNzYyNX0.CtSr4gsYtO5Zn9WYXr7TGpPFGHyTFFvvG6oJst1B6xo; xxtenc=ae21f750236073e55c3ad2ed66e1b299; DSSTASH_LOG=C_38-UN_2388-US_340877631-T_1768102825154; spaceFid=604; spaceRoleId=""; jrose=A13D09983EDE82B5A485A21A9117582D.mooc2-1883325526-62t2r; jrosehead=1D474D58E26B9A2F5D83AE559EE8D392.mooc-portal-3058043660-r5w9c',
     }
-
-    params = {
-        'courseid': f'{courseid}',
-        'clazzid': f'{clazzid}',
-        'cpi': f'{personid}',
-        'ut': 's',
-        't': f'{int(time.time() * 1000)}',
-        'stuenc': f'{enc}',
-    }
-
-    response = requests.get(
+    response = session.get(
         'https://mooc2-ans.chaoxing.com/mooc2-ans/mycourse/studentcourse',
         params=params,
-        cookies=cookies,
         headers=headers,
+        timeout=10
     )
     content = response.text
-    pattern_finish = r'已完成任务点: <span style="color:#00B368">(.*?)<'
-    pattern_total = r'</span>/(\d+)'
-    finish = re.search(pattern_finish, content).group(1)
-    total = re.search(pattern_total, content).group(1)
+
+    # 提取完成/总任务点
+    finish_match = RE_FINISH.search(content)
+    total_match = RE_TOTAL.search(content)
+    finish = finish_match.group(1) if finish_match else '0'
+    total = total_match.group(1) if total_match else '0'
+
+    # 1. 解析HTML
     soup = BeautifulSoup(content, 'html.parser')
-    # 提取所有chapter_item节点
-    chapter_items = soup.find_all('div', class_='chapter_item')
-    chapterids = []
 
-    for item in chapter_items:
-        # 排除已完成
-        if not item.find('div', class_='icon_yiwanc'):
-            # 检查是否有待完成任务点
-            if item.find('input', class_='knowledgeJobCount') or item.find('div', class_='catalog_jindu'):
-                # 提取chapterid
-                item_id = item.get('id', '')
-                if item_id.startswith('cur'):
-                    chapterids.append(item_id.replace('cur', ''))
-                else:
-                    checkbox = item.find('input', {'name': 'checkbox'})
-                    if checkbox and checkbox.get('value'):
-                        chapterids.append(checkbox.get('value'))
+    # 2. 提取符合条件的id（用Python原生strip()处理空白，避免转义问题）
+    unfinished_ids = []
+    for item in soup.find_all('div', class_='chapter_item'):
+        # 用Python的strip()去除文本首尾空白，替代错误的JS正则写法
+        item_text = item.get_text().strip()  # 等价于去除首尾空白，无转义警告
+        if '待完成任务点' in item_text:
+            item_id = item.get('id')
+            number = RE_NUMBER.findall(item_id)[0]
+            unfinished_ids.append(number)
 
-    return finish,total,chapterids
+    return finish, total, unfinished_ids
 
-def get_cards_v(cookies, courseid, clazzid, chapterid):
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
-    }
-
+def get_cards_v(courseid, clazzid, chapterid):
+    """获取cards_v参数"""
     params = {
-        'courseId': f'{courseid}',
-        'clazzid': f'{clazzid}',
-        'chapterId': f'{chapterid}',
+        'courseId': courseid,
+        'clazzid': clazzid,
+        'chapterId': chapterid,
         'cpi': '0',
         'verificationcode': '',
         'mooc2': '1',
         'microTopicId': '0',
         'editorPreview': '0',
     }
-
-    response = requests.get(
+    response = session.get(
         'https://mooc1.chaoxing.com/mooc-ans/mycourse/studentstudyAjax',
         params=params,
-        cookies=cookies,
-        headers=headers,
+        timeout=10
     )
-    content = response.text
-    pattern = r'v=(.*?)&'
-    try:
-        v = re.search(pattern, content).group(1)
-        return v
-    except:
-        print('get_v_error')
+    v_match = RE_V1.search(response.text)
+    if not v_match:
+        logger.error('未提取到cards_v参数')
+        return None
+    return v_match.group(1)
 
-def get_v(v,cookies):
-    headers = {
-        # 'Accept': '*/*',
-        # 'Accept-Language': 'zh-CN,zh;q=0.9',
-        # 'Cache-Control': 'no-cache',
-        # 'Connection': 'keep-alive',
-        # 'Pragma': 'no-cache',
-        #'Referer': 'https://mooc1.chaoxing.com/mooc-ans/knowledge/cards?clazzid=126922707&courseid=254985633&knowledgeid=1031257808&num=0&ut=s&cpi=404635848&v=2025-0424-1038-3&mooc2=1&isMicroCourse=false&editorPreview=0',
-        # 'Sec-Fetch-Dest': 'script',
-        # 'Sec-Fetch-Mode': 'no-cors',
-        # 'Sec-Fetch-Site': 'same-origin',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
-        # 'sec-ch-ua': '"Google Chrome";v="137", "Chromium";v="137", "Not/A)Brand";v="24"',
-        # 'sec-ch-ua-mobile': '?0',
-        # 'sec-ch-ua-platform': '"Windows"',
-        # 'Cookie': 'k8s-ed=1768038637.49.13085.718153; jrose=E917A32C4D861C3467DF267C4AFAD7DB.html-editor-a-379741770-gl3kd; k8s=1768038636.687.7553.421071; route=ce3aca120f3fcc9eb76807ea1ee5aae1; writenote=yes; fid=604; source=""; _uid=340877631; _d=1768102825152; UID=340877631; vc3=QCerNmM7VYPQFnLMJE1ykzLKibbQKv3ofX%2B9Bbn%2BAwXxXVx%2FMojtFql7BCgWDNplFyUMgDdphTQZuadz3lPTt9LX3hlE5ouCf3pJmRRE8ADvCJCnjCrm6J5ybj9O1A8MyBZE2Tp7WSlHACtXhv5LvPduOh5r9a6%2BMDkidk15b3A%3D503c7460e7813c24336144d9a7b86db0; uf=fbe48ba271b0dbbda0f23d4d7560668d20c0c7f6174700c7924fba3709ea73d09f424c3caac2622f78abafae41430b335d984d23a7662dfb9b0594e13f4b452fa995cca83579031aa94b593de5d847e4d649b59fbc966abce5851b744f8aa02c9fb3947ed09a594cb656531ee955ab093783faf299eb07b207aa1c10b563632f4dfd8fe371d6b8268e0cb4577cddd1f270b5a05e402d2a6370184964ffe8c27cf42ab3d23ff0667eae07e83b67ff7d52b1f899d50c1c3fa3aa2ebad65cd196bb; cx_p_token=15a111fe7605580357259da7cbe29d31; p_auth_token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiIzNDA4Nzc2MzEiLCJsb2dpblRpbWUiOjE3NjgxMDI4MjUxNTQsImV4cCI6MTc2ODcwNzYyNX0.CtSr4gsYtO5Zn9WYXr7TGpPFGHyTFFvvG6oJst1B6xo; xxtenc=ae21f750236073e55c3ad2ed66e1b299; DSSTASH_LOG=C_38-UN_2388-US_340877631-T_1768102825154; spaceFid=604; spaceRoleId=""; videojs_id=1715483; jrose=71B1CFD5ED3644F469AAD5913D7B7186.mooc-3710904213-fbbwr',
-    }
-
-    params = {
-        'v': f'{v}',
-    }
-
-    response = requests.get(
+def get_v(v):
+    """获取最终v参数"""
+    params = {'v': v}
+    response = session.get(
         'https://mooc1.chaoxing.com/ananas/ueditor/ueditor.parse.js',
         params=params,
-        cookies=cookies,
-        headers=headers,
+        timeout=10
     )
-    content = response.text
-    v = re.search(r'modules/video/index-review.html\?v=(.*?)"', content).group(1)
-    return v
+    v_match = RE_V2.search(response.text)
+    if not v_match:
+        logger.error('未提取到最终v参数')
+        return None
+    return v_match.group(1)
 
-def get_dtoken(cookies, v,objectid):
-    headers = {
-        'Referer': f'https://mooc1.chaoxing.com/ananas/modules/video/index.html?v={v}',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
-    }
-
+def get_dtoken(v, objectid):
+    """获取dtoken参数"""
+    headers = {'Referer': f'https://mooc1.chaoxing.com/ananas/modules/video/index.html?v={v}'}
     params = {
-        'k': f'{cookies['fid']}',
+        'k': session.cookies.get('fid', ''),  # 从Session的Cookie中获取fid
         'flag': 'normal',
         'ro': '0',
         '_dc': f'{int(time.time() * 1000)}',
     }
-
-    response = requests.get(
+    response = session.get(
         f'https://mooc1.chaoxing.com/ananas/status/{objectid}',
         params=params,
-        cookies=cookies,
         headers=headers,
+        timeout=10
     )
-
-    json_data = json.loads(response.text)
     try:
-        dtoken = json_data['dtoken']
-        return dtoken
-    except:
-        print('get_dtoken_error')
+        json_data = response.json()
+        return json_data.get('dtoken')
+    except Exception as e:
+        logger.error(f'获取dtoken失败：{e}')
+        return None
 
-#提交视频进度
-def main(clazzid, courseid, chapterid, personid, cookies,interval):
-    # global finish
-    cards_v = get_cards_v(cookies, courseid, clazzid, chapterid)
+def main(clazzid, courseid, chapterid, personid, interval):
+    """提交视频进度"""
+    cards_v = get_cards_v(courseid, clazzid, chapterid)
+    if not cards_v:
+        logger.warning(f'章节{chapterid}未获取到cards_v，跳过')
+        return
 
-    headers = {
-        # 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
-        # 'Accept-Language': 'zh-CN,zh;q=0.9',
-        # 'Cache-Control': 'no-cache',
-        # 'Connection': 'keep-alive',
-        # 'Pragma': 'no-cache',
-        # 'Referer': 'https://mooc1.chaoxing.com/mycourse/studentstudy?chapterId=1031257807&courseId=254985633&clazzid=126922707&cpi=404635848&enc=13282807a10886521f68c6cee47a7818&mooc2=1&hidetype=0&openc=583e870843feb6b6a503720a0e0cc107',
-        # 'Sec-Fetch-Dest': 'iframe',
-        # 'Sec-Fetch-Mode': 'navigate',
-        # 'Sec-Fetch-Site': 'same-origin',
-        # 'Upgrade-Insecure-Requests': '1',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
-        # 'sec-ch-ua': '"Google Chrome";v="137", "Chromium";v="137", "Not/A)Brand";v="24"',
-        # 'sec-ch-ua-mobile': '?0',
-        # 'sec-ch-ua-platform': '"Windows"',
-        # 'Cookie': 'k8s=1768038636.687.7553.421071; route=ce3aca120f3fcc9eb76807ea1ee5aae1; writenote=yes; fid=604; source=""; _uid=340877631; _d=1768102825152; UID=340877631; vc3=QCerNmM7VYPQFnLMJE1ykzLKibbQKv3ofX%2B9Bbn%2BAwXxXVx%2FMojtFql7BCgWDNplFyUMgDdphTQZuadz3lPTt9LX3hlE5ouCf3pJmRRE8ADvCJCnjCrm6J5ybj9O1A8MyBZE2Tp7WSlHACtXhv5LvPduOh5r9a6%2BMDkidk15b3A%3D503c7460e7813c24336144d9a7b86db0; uf=fbe48ba271b0dbbda0f23d4d7560668d20c0c7f6174700c7924fba3709ea73d09f424c3caac2622f78abafae41430b335d984d23a7662dfb9b0594e13f4b452fa995cca83579031aa94b593de5d847e4d649b59fbc966abce5851b744f8aa02c9fb3947ed09a594cb656531ee955ab093783faf299eb07b207aa1c10b563632f4dfd8fe371d6b8268e0cb4577cddd1f270b5a05e402d2a6370184964ffe8c27cf42ab3d23ff0667eae07e83b67ff7d52b1f899d50c1c3fa3aa2ebad65cd196bb; cx_p_token=15a111fe7605580357259da7cbe29d31; p_auth_token=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOiIzNDA4Nzc2MzEiLCJsb2dpblRpbWUiOjE3NjgxMDI4MjUxNTQsImV4cCI6MTc2ODcwNzYyNX0.CtSr4gsYtO5Zn9WYXr7TGpPFGHyTFFvvG6oJst1B6xo; xxtenc=ae21f750236073e55c3ad2ed66e1b299; DSSTASH_LOG=C_38-UN_2388-US_340877631-T_1768102825154; spaceFid=604; spaceRoleId=""; jrose=CCE9479D56C021114614FE5C1CED87AE.mooc-3710904213-fbbwr; videojs_id=6178284',
-    }
-
+    # 获取userid和v参数
     params = {
-        'clazzid': f'{clazzid}',
-        'courseid': f'{courseid}',
-        'knowledgeid': f'{chapterid}',
+        'clazzid': clazzid,
+        'courseid': courseid,
+        'knowledgeid': chapterid,
         'num': '0',
         'ut': 's',
-        'cpi': f'{personid}',
-        'v': f'{cards_v}',
+        'cpi': personid,
+        'v': cards_v,
         'mooc2': '1',
         'isMicroCourse': 'false',
         'editorPreview': '0',
     }
+    response = session.get('https://mooc1.chaoxing.com/mooc-ans/knowledge/cards', params=params, timeout=10)
+    userid_match = RE_USERID.search(response.text)
+    if not userid_match:
+        logger.warning(f'章节{chapterid}未提取到userid，跳过')
+        return
+    userid = userid_match.group(1)
 
-    response = requests.get('https://mooc1.chaoxing.com/mooc-ans/knowledge/cards', params=params, cookies=cookies,
-                            headers=headers)
+    # 提取v参数
+    v_match = re.search(r'<link type="text/css" href="/ananas/ueditor/themes/iframe.css\?v=(.*?)" rel="stylesheet" />', response.text)
+    if not v_match:
+        logger.warning(f'章节{chapterid}未提取到v参数，跳过')
+        return
+    v = get_v(v_match.group(1))
+    if not v:
+        return
 
-    # 获取userid
-    userid = re.search(r'"userid":"(.*?)",', response.text).group(1)
-    # 获取v
-    v = re.search(r'<link type="text/css" href="/ananas/ueditor/themes/iframe.css\?v=(.*?)" rel="stylesheet" />',
-                  response.text).group(1)
-    v = get_v(v, cookies)
+    # 解析视频数据
+    mArg = RE_MARG.findall(response.text)
+    if len(mArg) < 2:
+        logger.warning(f'章节{chapterid}未提取到mArg，跳过')
+        return
+    try:
+        datas = json.loads(mArg[1])['attachments']
+    except Exception as e:
+        logger.error(f'解析mArg失败：{e}')
+        return
 
-    mArg = re.findall(r'mArg = (.*?);', response.text)
-    datas = json.loads(mArg[1])
-    datas = datas['attachments']
-    # print(datas)
-    print(f'当前任务章节:{chapterid}')
+    logger.info(f'开始处理章节{chapterid}')
     for data in datas:
-        if data['type'] =='video':
-            # print(data)
-            duration = data['attDuration']
-            objectid = data['property']['objectid']
-            otherInfo = data['otherInfo']
-            otherInfo = re.search(r'(.*?)&', otherInfo).group(1)
-            jobid = data['property']['jobid']
-            attDurationEnc = data['attDurationEnc']
-            videoFaceCaptureEnc = data['videoFaceCaptureEnc']
-            clipTime = '0_' + '{}'.format(duration)
-            dtoken = get_dtoken(cookies, v, objectid)
-            n = duration//interval
+        try:
+            if data.get('type') != 'video':
+                continue
+            duration = data.get('attDuration', 0)
+            objectid = data.get('property', {}).get('objectid')
+            if not objectid:
+                continue
+            otherInfo = data.get('otherInfo', '')
+            otherInfo = RE_OTHERINFO.search(otherInfo).group(1) if RE_OTHERINFO.search(otherInfo) else ''
+            jobid = data.get('property', {}).get('jobid') or data.get('property', {}).get('_jobid')
+            attDurationEnc = data.get('attDurationEnc', '')
+            videoFaceCaptureEnc = data.get('videoFaceCaptureEnc', '')
+            clipTime = f'0_{duration}'
+            dtoken = get_dtoken(v, objectid)
+            if not dtoken:
+                continue
+
+            # 循环提交进度
             playingtime = 0
-            for i in range(n+2):
-                print(f'已提交时长: {playingtime}')
-                print(f'剩余时长: {duration-playingtime}')
+            n = duration // interval
+            for i in range(n + 2):
+                logger.info(f'章节{chapterid} - 已提交时长:{playingtime} / 总时长:{duration}')
                 enc = get_enc(clazzid, userid, jobid, objectid, playingtime, duration, clipTime)
                 params = {
-                    'clazzId': f'{clazzid}',
-                    'playingTime': f'{playingtime}',
-                    'duration': f'{duration}',
-                    'clipTime': '0_' + str(duration),
-                    'objectId': f'{objectid}',
-                    'otherInfo': f'{otherInfo}',
-                    'courseId': f'{courseid}',
-                    'jobid': f'{jobid}',
-                    'userid': f'{userid}',
+                    'clazzId': clazzid,
+                    'playingTime': playingtime,
+                    'duration': duration,
+                    'clipTime': clipTime,
+                    'objectId': objectid,
+                    'otherInfo': otherInfo,
+                    'courseId': courseid,
+                    'jobid': jobid,
+                    'userid': userid,
                     'isdrag': '0',
                     'view': 'pc',
-                    'enc': f'{enc}',
+                    'enc': enc,
                     'rt': '0.9',
-                    'videoFaceCaptureEnc': f'{videoFaceCaptureEnc}',
+                    'videoFaceCaptureEnc': videoFaceCaptureEnc,
                     'dtype': 'Video',
-                    '_t': f'{int(time.time() * 1000)}',
-                    'attDuration': f'{duration}',
-                    'attDurationEnc': f'{attDurationEnc}',
+                    '_t': int(time.time() * 1000),
+                    'attDuration': duration,
+                    'attDurationEnc': attDurationEnc,
                 }
-                # print(params)
-                response = requests.get(
+                # 提交进度
+                resp = session.get(
                     f'https://mooc1.chaoxing.com/mooc-ans/multimedia/log/a/{personid}/{dtoken}',
                     params=params,
-                    cookies=cookies,
-                    headers=headers,
+                    timeout=10
                 )
-                print(response.text)
-                content = json.loads(response.text)
-                if content['isPassed'] == True:
+                resp_json = resp.json()
+                if resp_json.get('isPassed'):
+                    logger.info(f'章节{chapterid}进度提交完成，已通过')
                     break
-                time.sleep(interval-3)
+                # 休眠（避免过快请求）
+                time.sleep(max(1, interval - 3))  # 确保至少休眠1秒
+                # 更新播放时长
                 if playingtime + interval <= duration:
                     playingtime += interval
                 else:
                     playingtime = duration
+        except Exception as e:
+            logger.error(f'处理章节{chapterid}视频失败：{e}')
+            continue
 
-            # finish += 1
-            # print(f'已完成任务点数:{finish}')
+# ====================== 主程序 ======================
+if __name__ == "__main__":
+    # 请手动输入账号密码，或从config.py导入
+    # uname = input('请输入学习通账号：')
+    # pwd = input('请输入学习通密码：')
 
+    try:
+        # 登录（Session自动维护Cookie）
+        get_cookies(uname, pwd)
+        # 获取课程列表
+        course_data = get_course_list()
+        logger.info('已获取课程列表：')
+        for idx, course in enumerate(course_data):
+            logger.info(f'{idx+1}. {course["title"]} - clazzid:{course["clazzid"]} - courseid:{course["courseid"]}')
 
-# uname =input('请输入账号:')
-# pwd = input('请输入密码:')
+        if not course_data:
+            logger.error('未获取到任何课程')
+            exit(1)
 
+        personid = course_data[0]['personid']
 
-cookies = get_cookies(uname, pwd)
+        clazzid = input('\n请输入要学习的课程clazzid：')
+        courseid = input('请输入要学习的课程courseid：')
 
-course_data = get_course_list(cookies)
-for course in course_data:
-    print(course)
+        # 查找未完成章节
+        finish, total, chapterids = find_chapterid(courseid, clazzid, personid)
+        finish = int(finish)
+        logger.info(f'已完成任务点数:{finish}, 总任务点数:{total}')
+        logger.info(f'待完成章节{chapterids}')
+        logger.info(f'待完成章节数量：{len(chapterids)}')
 
-personid = course_data[0]['personid']
+        # 配置提交间隔（建议30-60秒）
+        interval = 30
+        # 逐个处理章节
+        for chapterid in chapterids:
+            main(clazzid, courseid, chapterid, personid, interval)
 
-clazzid =input('请输入clazzid:')
-courseid = input('请输入courseid:')
-
-
-finish,total,chapterids = find_chapterid(courseid, clazzid,personid)
-finish = int(finish)
-
-print(f'已完成任务点数:{finish},总任务点数:{total}')
-# print(chapterids)
-
-interval = 30    #视频提交间隔（建议30到60）
-
-for chapterid in chapterids:
-    main(clazzid, courseid, chapterid, personid, cookies,interval)
-
-
-
-
-
-
-
-
-
+        logger.info('所有章节处理完成')
+    except Exception as e:
+        logger.error(f'程序执行失败：{e}')
