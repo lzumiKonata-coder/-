@@ -435,7 +435,7 @@ def main(clazzid, courseid, chapterid, personid, interval):
                     logger.info(f'章节{chapterid}进度提交完成，已通过')
                     break
                 # 休眠（避免过快请求）
-                time.sleep(max(1, interval - 3))  # 确保至少休眠1秒
+                time.sleep(random.randint(1,5)) # 确保至少休眠1秒
                 # 更新播放时长
                 if playingtime + interval <= duration:
                     playingtime += interval
@@ -485,3 +485,4 @@ if __name__ == "__main__":
         logger.info('所有章节处理完成')
     except Exception as e:
         logger.error(f'程序执行失败：{e}')
+
