@@ -1,3 +1,4 @@
+# import traceback
 import requests
 import re
 import execjs
@@ -5,6 +6,9 @@ import time
 import json
 from config import *
 import logging
+import datetime
+import urllib.parse
+import random
 from bs4 import BeautifulSoup
 from hashlib import md5
 from requests.adapters import HTTPAdapter
@@ -21,7 +25,7 @@ retry_strategy = Retry(
 )
 adapter = HTTPAdapter(max_retries=retry_strategy)
 session.mount('https://', adapter)
-session.mount('http://', adapter)
+
 # 全局请求头
 session.headers.update({
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36',
@@ -31,7 +35,7 @@ session.headers.update({
     'sec-ch-ua-platform': '"Windows"',
 })
 
-# 预编译正则（减少重复编译开销）
+# 预编译正则
 RE_JSESSIONID = re.compile(r'JSESSIONID=(.*?);')
 RE_ROUTE = re.compile(r'route=(.*?);')
 RE_S = re.compile(r'\?s=(.*?)\'')
@@ -45,7 +49,9 @@ RE_V2 = re.compile(r'modules/video/index-review.html\?v=(.*?)"')
 RE_USERID = re.compile(r'"userid":"(.*?)",')
 RE_MARG = re.compile(r'mArg = (.*?);')
 RE_OTHERINFO = re.compile(r'(.*?)&')
+RE_UNFINISHED = re.compile(r"<span class=\"bntHoverTips\">(.*?)<i></i></span></div>")
 RE_NUMBER = re.compile(r'(\d+)')
+RE_EXT = re.compile(r'_from = (.*?);')
 
 # 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
@@ -257,6 +263,12 @@ def find_chapterid(courseid, clazzid, personid):
     total_match = RE_TOTAL.search(content)
     finish = finish_match.group(1) if finish_match else '0'
     total = total_match.group(1) if total_match else '0'
+    nu = RE_UNFINISHED.findall(content)
+    # 未完成章节的任务点
+    unfinished = []
+    for i in nu:
+        if "任务点" in i:
+            unfinished.append(int(i[0]))
 
     # 1. 解析HTML
     soup = BeautifulSoup(content, 'html.parser')
@@ -271,7 +283,7 @@ def find_chapterid(courseid, clazzid, personid):
             number = RE_NUMBER.findall(item_id)[0]
             unfinished_ids.append(number)
 
-    return finish, total, unfinished_ids
+    return finish, total, unfinished_ids,unfinished
 
 def get_cards_v(courseid, clazzid, chapterid):
     """获取cards_v参数"""
@@ -332,125 +344,231 @@ def get_dtoken(v, objectid):
         logger.error(f'获取dtoken失败：{e}')
         return None
 
-def main(clazzid, courseid, chapterid, personid, interval):
+def generate_time_str():
+    """
+    生成 年月日时分秒毫秒 格式的时间字符串（如2026 03 02 20 47 51 142）
+    :return: 拼接后的时间数字串
+    """
+    # 使用当前系统时间
+    time_obj = datetime.datetime.now()
+
+    # 按格式拼接
+    time_str = time_obj.strftime("%Y%m%d%H%M%S%f")[:-3]
+    return time_str
+
+def get_wc(a):
+    wc = ''
+    for i in range(1, a+1):
+        wc += str(i) + " "
+    return len(wc)-1
+
+def get_ppt_enc(userid,time,dic):
+    # 转为字符串格式
+    json_str = json.dumps(dic, separators=(",", ":"), ensure_ascii=False)
+    full_str = json_str + "readPoint"+time+userid
+
+    # 转成URL编码格式
+    encoded_str = urllib.parse.quote(full_str)
+    with open("get_doc_enc.js", "r", encoding="utf-8") as f:
+        content = f.read()
+        JS = execjs.compile(content)
+        ppt_enc = JS.call("get_enc", encoded_str)
+    return ppt_enc
+
+def main(clazzid, courseid, chapterid, unfinish,personid, interval):
     """提交视频进度"""
     cards_v = get_cards_v(courseid, clazzid, chapterid)
     if not cards_v:
         logger.warning(f'章节{chapterid}未获取到cards_v，跳过')
         return
+    for u in range(0, unfinish):
+        # 获取userid和v参数
+        params = {
+            'clazzid': clazzid,
+            'courseid': courseid,
+            'knowledgeid': chapterid,
+            'num': str(u),
+            'ut': 's',
+            'cpi': personid,
+            'v': cards_v,
+            'mooc2': '1',
+            'isMicroCourse': 'false',
+            'editorPreview': '0',
+        }
+        response = session.get('https://mooc1.chaoxing.com/mooc-ans/knowledge/cards', params=params, timeout=10)
 
-    # 获取userid和v参数
-    params = {
-        'clazzid': clazzid,
-        'courseid': courseid,
-        'knowledgeid': chapterid,
-        'num': '0',
-        'ut': 's',
-        'cpi': personid,
-        'v': cards_v,
-        'mooc2': '1',
-        'isMicroCourse': 'false',
-        'editorPreview': '0',
-    }
-    response = session.get('https://mooc1.chaoxing.com/mooc-ans/knowledge/cards', params=params, timeout=10)
-    userid_match = RE_USERID.search(response.text)
-    if not userid_match:
-        logger.warning(f'章节{chapterid}未提取到userid，跳过')
-        return
-    userid = userid_match.group(1)
+        userid_match = RE_USERID.search(response.text)
 
-    # 提取v参数
-    v_match = re.search(r'<link type="text/css" href="/ananas/ueditor/themes/iframe.css\?v=(.*?)" rel="stylesheet" />', response.text)
-    if not v_match:
-        logger.warning(f'章节{chapterid}未提取到v参数，跳过')
-        return
-    v = get_v(v_match.group(1))
-    if not v:
-        return
+        if not userid_match:
+            logger.warning(f'章节{chapterid}未提取到userid，跳过')
+            return
+        userid = userid_match.group(1)
 
-    # 解析视频数据
-    mArg = RE_MARG.findall(response.text)
-    if len(mArg) < 2:
-        logger.warning(f'章节{chapterid}未提取到mArg，跳过')
-        return
-    try:
-        datas = json.loads(mArg[1])['attachments']
-    except Exception as e:
-        logger.error(f'解析mArg失败：{e}')
-        return
+        # 提取v参数
+        v_match = re.search(r'<link type="text/css" href="/ananas/ueditor/themes/iframe.css\?v=(.*?)" rel="stylesheet" />', response.text)
+        if not v_match:
+            logger.warning(f'章节{chapterid}未提取到v参数，跳过')
+            return
+        v = get_v(v_match.group(1))
+        if not v:
+            return
 
-    logger.info(f'开始处理章节{chapterid}')
-    for data in datas:
+        # 解析视频数据
+        mArg = RE_MARG.findall(response.text)
+        if len(mArg) < 2:
+            logger.warning(f'章节{chapterid}未提取到mArg，跳过')
+            return
         try:
-            if data.get('type') != 'video':
-                continue
-            duration = data.get('attDuration', 0)
-            objectid = data.get('property', {}).get('objectid')
-            if not objectid:
-                continue
-            otherInfo = data.get('otherInfo', '')
-            otherInfo = RE_OTHERINFO.search(otherInfo).group(1) if RE_OTHERINFO.search(otherInfo) else ''
-            jobid = data.get('property', {}).get('jobid') or data.get('property', {}).get('_jobid')
-            attDurationEnc = data.get('attDurationEnc', '')
-            videoFaceCaptureEnc = data.get('videoFaceCaptureEnc', '')
-            clipTime = f'0_{duration}'
-            dtoken = get_dtoken(v, objectid)
-            if not dtoken:
-                continue
-
-            # 循环提交进度
-            playingtime = 0
-            n = duration // interval
-            for i in range(n + 2):
-                logger.info(f'章节{chapterid} - 已提交时长:{playingtime} / 总时长:{duration}')
-                enc = get_enc(clazzid, userid, jobid, objectid, playingtime, duration, clipTime)
-                params = {
-                    'clazzId': clazzid,
-                    'playingTime': playingtime,
-                    'duration': duration,
-                    'clipTime': clipTime,
-                    'objectId': objectid,
-                    'otherInfo': otherInfo,
-                    'courseId': courseid,
-                    'jobid': jobid,
-                    'userid': userid,
-                    'isdrag': '0',
-                    'view': 'pc',
-                    'enc': enc,
-                    'rt': '0.9',
-                    'videoFaceCaptureEnc': videoFaceCaptureEnc,
-                    'dtype': 'Video',
-                    '_t': int(time.time() * 1000),
-                    'attDuration': duration,
-                    'attDurationEnc': attDurationEnc,
-                }
-                # 提交进度
-                resp = session.get(
-                    f'https://mooc1.chaoxing.com/mooc-ans/multimedia/log/a/{personid}/{dtoken}',
-                    params=params,
-                    timeout=10
-                )
-                resp_json = resp.json()
-                if resp_json.get('isPassed'):
-                    logger.info(f'章节{chapterid}进度提交完成，已通过')
-                    break
-                # 休眠（避免过快请求）
-                time.sleep(max(1, interval - 3))
-                time.sleep(random.randint(1,3)) #随机休眠1-3秒
-                # 更新播放时长
-                if playingtime + interval <= duration:
-                    playingtime += interval
-                else:
-                    playingtime = duration
+            datas = json.loads(mArg[1])['attachments']
         except Exception as e:
-            logger.error(f'处理章节{chapterid}视频失败：{e}')
-            continue
+            logger.error(f'解析mArg失败：{e}')
+            return
+
+        logger.info(f'开始处理章节{chapterid}')
+        # logger.info(datas)
+        for data in datas:
+            try:
+                # 视频
+                if data.get('type') == 'video':
+                    duration = data.get('attDuration', 0)
+                    objectid = data.get('property', {}).get('objectid')
+                    if not objectid:
+                        continue
+                    otherInfo = data.get('otherInfo', '')
+                    otherInfo = RE_OTHERINFO.search(otherInfo).group(1) if RE_OTHERINFO.search(otherInfo) else ''
+                    jobid = data.get('property', {}).get('jobid') or data.get('property', {}).get('_jobid')
+                    attDurationEnc = data.get('attDurationEnc', '')
+                    videoFaceCaptureEnc = data.get('videoFaceCaptureEnc', '')
+                    clipTime = f'0_{duration}'
+                    dtoken = get_dtoken(v, objectid)
+                    if not dtoken:
+                        continue
+
+                    # 循环提交进度
+                    playingtime = 0
+                    n = duration // interval
+                    for i in range(n + 2):
+                        logger.info(f'章节{chapterid} - 已提交时长:{playingtime} / 总时长:{duration}')
+                        enc = get_enc(clazzid, userid, jobid, objectid, playingtime, duration, clipTime)
+                        params = {
+                            'clazzId': clazzid,
+                            'playingTime': playingtime,
+                            'duration': duration,
+                            'clipTime': clipTime,
+                            'objectId': objectid,
+                            'otherInfo': otherInfo,
+                            'courseId': courseid,
+                            'jobid': jobid,
+                            'userid': userid,
+                            'isdrag': '0',
+                            'view': 'pc',
+                            'enc': enc,
+                            'rt': '0.9',
+                            'videoFaceCaptureEnc': videoFaceCaptureEnc,
+                            'dtype': 'Video',
+                            '_t': int(time.time() * 1000),
+                            'attDuration': duration,
+                            'attDurationEnc': attDurationEnc,
+                        }
+                        # 提交进度
+                        resp = session.get(
+                            f'https://mooc1.chaoxing.com/mooc-ans/multimedia/log/a/{personid}/{dtoken}',
+                            params=params,
+                            timeout=10
+                        )
+                        resp_json = resp.json()
+                        logger.info(resp_json)
+                        if resp_json.get('isPassed'):
+                            logger.info(f'章节{chapterid}任务{u+1}进度提交完成，已通过')
+                            break
+                        # 休眠（避免过快请求）
+                        time.sleep(max(1, interval))
+                        time.sleep(random.randint(0,2))
+                        # 更新播放时长
+                        if playingtime + interval <= duration:
+                            playingtime += interval
+                        else:
+                            playingtime = duration
+                # PPT
+                elif data.get('type') == 'document':
+                    # 获取ext参数:刷ppt用
+                    ext = RE_EXT.findall(response.text)[0]
+                    # logger.info(ext)
+
+                    # 获取pagenum
+                    pagenum = int(data.get('property', {}).get('pagenum') or 0)
+                    objectid = data.get('property', {}).get('objectid')
+                    jobid = data.get('property', {}).get('jobid') or data.get('property', {}).get('_jobid')
+                    jtoken = data.get('jtoken')
+                    wc = get_wc(pagenum)
+                    for i in range(pagenum):
+                        # 页面高度
+                        random_num = random.uniform(-1, 1)
+                        rounded_num = round(random_num, 6)
+                        h = 300 * i
+                        if h > 300 * pagenum:
+                            h = 300 * pagenum
+                        else:
+                            h += i * rounded_num
+
+                        d = {
+                            "r": objectid,
+                            "t": "doc",
+                            "l": 1,
+                            "f": 4,
+                            "p": 1,
+                            "tp": 1,
+                            "wc": wc,
+                            "ic": pagenum,
+                            "v": 2,
+                            "s": 2,
+                            "h": h,
+                            "ext": ext
+                        }
+
+                        # 生成当前时间的时间串
+                        current_time_str = generate_time_str()
+                        # 生成enc
+                        ppt_enc = get_ppt_enc(str(userid), current_time_str, d)
+                        params = {
+                            'f': 'readPoint',
+                            'u': userid,
+                            'd': f'{d}',
+                            't': current_time_str,
+                            'enc': ppt_enc,
+                        }
+
+                        response = session.get(
+                            'https://data-xxt.aichaoxing.com/analysis/ac_mark',
+                            params=params,
+                            timeout=10
+                        )
+                        time.sleep(random.randint(0, 2))
+
+                    params = {
+                        'jobid': jobid,
+                        'knowledgeid': chapterid,  # 章节id
+                        'courseid': courseid,
+                        'clazzid': clazzid,
+                        'jtoken': jtoken,
+                        'checkMicroTopic': 'true',
+                        'microTopicId': 'undefined',
+                        '_dc': str(int(1000*time.time())),
+                    }
+
+                    resp = session.get('https://mooc1.chaoxing.com/mooc-ans/job/document', params=params,timeout=10)
+                    resp_json = resp.json()
+                    logger.info(resp_json)
+                    if resp_json.get('status'):
+                        logger.info(f'章节{chapterid}任务{u+1}进度提交完成，已通过')
+
+            except Exception as e:
+                logger.error(f'处理章节{chapterid}视频失败：{e}')
+                # traceback.print_exc()
+                continue
 
 # ====================== 主程序 ======================
 if __name__ == "__main__":
-    # 请手动输入账号密码，或从config.py导入
-    # uname = input('请输入学习通账号：')
-    # pwd = input('请输入学习通密码：')
 
     try:
         # 登录（Session自动维护Cookie）
@@ -466,12 +584,13 @@ if __name__ == "__main__":
             exit(1)
 
         personid = course_data[0]['personid']
-
-        clazzid = input('\n请输入要学习的课程clazzid：')
+        time.sleep(1)
+        clazzid = input('请输入要学习的课程clazzid：')
         courseid = input('请输入要学习的课程courseid：')
 
         # 查找未完成章节
-        finish, total, chapterids = find_chapterid(courseid, clazzid, personid)
+        finish, total, chapterids,unfinished = find_chapterid(courseid, clazzid, personid)
+        # logger.info(unfinished)
         finish = int(finish)
         logger.info(f'已完成任务点数:{finish}, 总任务点数:{total}')
         logger.info(f'待完成章节{chapterids}')
@@ -480,11 +599,10 @@ if __name__ == "__main__":
         # 配置提交间隔（建议30-60秒）
         interval = 30
         # 逐个处理章节
-        for chapterid in chapterids:
-            main(clazzid, courseid, chapterid, personid, interval)
-
+        for chapterid,unfinish in zip(chapterids, unfinished):
+            main(clazzid, courseid, chapterid, unfinish,personid, interval)
+        #测试用
+        # main(clazzid, courseid, chapterids[1],unfinished[1], personid, interval)
         logger.info('所有章节处理完成')
     except Exception as e:
         logger.error(f'程序执行失败：{e}')
-
-
