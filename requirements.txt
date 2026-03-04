@@ -1,0 +1,5 @@
+requests==2.32.5
+urllib3==2.6.3
+beautifulsoup4==4.14.3
+pyexecjs==1.5.1
+lxml==6.0.2
