@@ -1,4 +1,4 @@
-# 自动过视频和阅读任务点
+# 自动过视频和阅读任务点（video和document类型）
 <h3> 1.配置好python和node解释器
 <h3> 2.执行pip install -r requirements.txt
 <h3> 3.执行npm install crypto-js
