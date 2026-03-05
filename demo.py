@@ -1,7 +1,6 @@
 # import traceback
 import requests
 import re
-import execjs
 import time
 import json
 from config import *
@@ -13,6 +12,8 @@ from bs4 import BeautifulSoup
 from hashlib import md5
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from encrypt import *
+from doc_enc import get_doc_enc
 
 # ====================== 全局配置 ======================
 # 初始化Session，自动管理Cookie，添加重试/超时配置
@@ -89,10 +90,8 @@ def get_cookies(uname, pwd):
     # 使用session发起请求，自动保存Cookie
     session.get('https://passport2.chaoxing.com/login', params=params, headers=headers, timeout=10)
 
-    # 第二步：加载加密JS并获取加密后的账号密码
-    with open('encrypt.js', 'r', encoding='utf-8') as f:
-        ctx = execjs.compile(f.read())
-    data = ctx.call('get_uname_password', uname, pwd)
+    # 第二步：获取加密后的账号密码
+    data = get_uname_password(uname, pwd)
 
     # 第三步：提交登录
     headers = {
@@ -369,10 +368,7 @@ def get_ppt_enc(userid,time,dic):
 
     # 转成URL编码格式
     encoded_str = urllib.parse.quote(full_str)
-    with open("get_doc_enc.js", "r", encoding="utf-8") as f:
-        content = f.read()
-        JS = execjs.compile(content)
-        ppt_enc = JS.call("get_enc", encoded_str)
+    ppt_enc = get_doc_enc(encoded_str)
     return ppt_enc
 
 def main(clazzid, courseid, chapterid, unfinish,personid, interval):
@@ -479,7 +475,7 @@ def main(clazzid, courseid, chapterid, unfinish,personid, interval):
                         resp_json = resp.json()
                         logger.info(resp_json)
                         if resp_json.get('isPassed'):
-                            logger.info(f'章节{chapterid}任务{u+1}进度提交完成，已通过')
+                            logger.info(f'章节{chapterid}任务进度提交完成，已通过')
                             break
                         # 休眠（避免过快请求）
                         time.sleep(max(1, interval))
@@ -569,7 +565,6 @@ def main(clazzid, courseid, chapterid, unfinish,personid, interval):
 
 # ====================== 主程序 ======================
 if __name__ == "__main__":
-
     try:
         # 登录（Session自动维护Cookie）
         get_cookies(uname, pwd)
@@ -602,7 +597,7 @@ if __name__ == "__main__":
         for chapterid,unfinish in zip(chapterids, unfinished):
             main(clazzid, courseid, chapterid, unfinish,personid, interval)
         #测试用
-        # main(clazzid, courseid, chapterids[1],unfinished[1], personid, interval)
+        #main(clazzid, courseid, chapterids[18],unfinished[18], personid, interval)
         logger.info('所有章节处理完成')
     except Exception as e:
         logger.error(f'程序执行失败：{e}')
